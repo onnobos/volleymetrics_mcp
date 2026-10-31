@@ -1,0 +1,73 @@
+{
+  "name": "volleymetrics-mcp",
+  "version": "0.1.0",
+  "description": "Production-grade Model Context Protocol (MCP) server for Volleymetrics and Hudl volleyball analytics",
+  "author": "Volleymetrics MCP Team",
+  "license": "MIT",
+  "homepage": "https://github.com/onnobos/volleymetrics_mcp",
+  "server": {
+    "type": "stdio",
+    "command": "uvx",
+    "args": [
+      "--from",
+      "git+https://github.com/onnobos/volleymetrics_mcp.git",
+      "volleymetrics-mcp"
+    ]
+  },
+  "tools": [
+    {
+      "name": "get_user_teams",
+      "description": "Discover and list all Volleymetrics teams and accounts associated with your credentials"
+    },
+    {
+      "name": "list_volleyball_matches",
+      "description": "Fetch match schedule and recent games for a team from Volleymetrics"
+    },
+    {
+      "name": "get_match_player_stats",
+      "description": "Fetch athlete box scores and volleyball statistics for a match"
+    },
+    {
+      "name": "get_rotation_breakdown",
+      "description": "Fetch tactical performance metrics broken down by rotation (P1-P6)"
+    },
+    {
+      "name": "get_game_actions",
+      "description": "Retrieve tagged volleyball actions and touch events with DataVolley (.dvw) codes"
+    },
+    {
+      "name": "download_match_dvw",
+      "description": "Download or generate official DataVolley (.dvw) scouting file or Sportscode XML"
+    },
+    {
+      "name": "login_to_volleymetrics",
+      "description": "Open an interactive pop-up browser window to log into Volleymetrics"
+    },
+    {
+      "name": "refresh_volleymetrics_cookie",
+      "description": "Refresh session token or guide user to interactive login"
+    }
+  ],
+  "prompts": [
+    {
+      "name": "scout_opponent",
+      "description": "Generate a tactical scouting report on an opponent team"
+    },
+    {
+      "name": "analyze_rotation_weaknesses",
+      "description": "Diagnose sideout and point scoring vulnerabilities across rotations P1-P6"
+    },
+    {
+      "name": "match_mvp_breakdown",
+      "description": "Select the match MVP using advanced volleyball metrics and clutch touch analysis"
+    },
+    {
+      "name": "datavolley_export",
+      "description": "Translate match touch data into standardized DataVolley (.dvw) scouting codes"
+    },
+    {
+      "name": "serve_receive_audit",
+      "description": "Conduct a serve-receive and passing performance audit"
+    }
+  ]
+}

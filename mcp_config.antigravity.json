@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "volleymetrics": {
+      "command": "python",
+      "args": ["-m", "volleymetrics_mcp.server"],
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}
