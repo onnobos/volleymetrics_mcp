@@ -9,7 +9,7 @@ Percentage = (Kills - Errors) / Attacks), and outputs compact analytical represe
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from pydantic import BaseModel, Field, model_validator
 
 
@@ -231,8 +231,8 @@ class RotationStats(BaseModel):
 class VolleyballAction(BaseModel):
     """Detailed volleyball action / touch event from video breakdown."""
 
-    action_id: Optional[int] = Field(None, description="Action or touch event ID")
-    rally_id: Optional[int] = Field(None, description="Rally ID")
+    action_id: Optional[Union[int, str]] = Field(None, description="Action or touch event ID")
+    rally_id: Optional[Union[int, str]] = Field(None, description="Rally ID")
     set_number: int = Field(1, description="Set number (1-5)")
     score: Optional[str] = Field(None, description="Score at time of action, e.g. '12-7'")
     timestamp_seconds: Optional[float] = Field(None, description="Timestamp in seconds from video start")
@@ -247,8 +247,8 @@ class VolleyballAction(BaseModel):
     quality: Optional[str] = Field(None, description="Result/quality (kill, error, ace, assist, in_play, rating 1-3)")
     attack_type: Optional[str] = Field(None, description="Attack set route / type (e.g. quick, pipe, high)")
     first_ball_side_out: bool = Field(False, description="Whether this action was during a first-ball sideout")
-    source_zone: Optional[int] = Field(None, description="Origin court zone (1-6)")
-    dest_zone: Optional[int] = Field(None, description="Destination court zone (1-6)")
+    source_zone: Optional[Union[int, float]] = Field(None, description="Origin court coordinate or zone")
+    dest_zone: Optional[Union[int, float]] = Field(None, description="Destination court coordinate or zone")
     speed_kmh: Optional[float] = Field(None, description="Ball speed in km/h")
     details: Optional[str] = Field(None, description="Extra tactical details")
 
@@ -513,7 +513,9 @@ def format_actions_markdown(actions: List[VolleyballAction], match_name: str) ->
 
     for a in actions:
         time_str = a.timestamp_formatted or "-"
-        zone_str = f"Z{a.source_zone}->Z{a.dest_zone}" if a.source_zone and a.dest_zone else "-"
+        sz = f"{a.source_zone:.1f}" if isinstance(a.source_zone, float) else f"{a.source_zone}"
+        dz = f"{a.dest_zone:.1f}" if isinstance(a.dest_zone, float) else f"{a.dest_zone}"
+        zone_str = f"({sz}->{dz})" if a.source_zone is not None and a.dest_zone is not None else "-"
         route_str = f"{a.attack_type} ({zone_str})" if a.attack_type else zone_str
 
         lines.append(
@@ -525,15 +527,19 @@ def format_actions_markdown(actions: List[VolleyballAction], match_name: str) ->
 
 
 def render_actions_output(
-    actions: List[VolleyballAction], match_name: str, output_format: str = "markdown"
+    actions: List[VolleyballAction],
+    match_name: Optional[str] = None,
+    match_id: Optional[str] = None,
+    output_format: str = "markdown",
 ) -> str:
     """Render game actions in Markdown or compact JSON."""
+    name = match_name or match_id or "Match"
     if output_format.lower() == "compact":
         return json.dumps(
-            {"match": match_name, "total_events": len(actions), "actions": [a.to_compact_dict() for a in actions]},
+            {"match": name, "total_events": len(actions), "actions": [a.to_compact_dict() for a in actions]},
             indent=2,
         )
-    return format_actions_markdown(actions, match_name=match_name)
+    return format_actions_markdown(actions, match_name=name)
 
 
 # ---------------------------------------------------------------------------
@@ -568,13 +574,49 @@ def parse_teams_response(
         seen_ids.add(tid)
 
         name = team_obj.get("name") or item.get("name") or f"Team {tid}"
+        
         school = team_obj.get("school") or team_obj.get("organization") or item.get("schoolName")
-        conf = team_obj.get("conference") or item.get("conference")
-        role = item.get("role") or item.get("userRole")
-        season = item.get("season") or team_obj.get("season")
-        gender = team_obj.get("gender")
+        if isinstance(school, dict):
+            school = school.get("name") or school.get("schoolName")
+        elif school is not None:
+            school = str(school)
 
-        is_current = (active_team_id and str(tid) == str(active_team_id)) or bool(item.get("isDefault"))
+        conf = team_obj.get("conference") or item.get("conference")
+        if isinstance(conf, dict):
+            conf = conf.get("name") or conf.get("conferenceName")
+        elif conf is not None:
+            conf = str(conf)
+
+        role = item.get("role") or item.get("userRole")
+        if isinstance(role, dict):
+            role = role.get("name") or role.get("role")
+        elif not role and isinstance(item.get("accountType"), dict):
+            role = item["accountType"].get("accountClass")
+        elif role is not None:
+            role = str(role)
+
+        season = item.get("season") or team_obj.get("season")
+        if not season and isinstance(team_obj.get("conference"), dict):
+            seasons = team_obj["conference"].get("conferenceSeasons", [])
+            active_s = next((s for s in seasons if s.get("status") == "ACTIVE"), None)
+            if active_s:
+                season = active_s.get("season", {}).get("name")
+        if isinstance(season, dict):
+            season = season.get("name") or season.get("year")
+        elif season is not None:
+            season = str(season)
+
+        gender = team_obj.get("gender")
+        if not gender and isinstance(team_obj.get("conference"), dict):
+            gender = team_obj["conference"].get("gender")
+        if gender is not None:
+            gender = str(gender)
+
+        is_current = (
+            (active_team_id and str(tid) == str(active_team_id))
+            or bool(item.get("isDefault"))
+            or (len(items) == 1)
+        )
 
         teams.append(
             TeamInfo(
@@ -592,7 +634,9 @@ def parse_teams_response(
     return teams
 
 
-def parse_matches_response(data: Any) -> List[MatchSummary]:
+def parse_matches_response(
+    data: Any, active_team_id: Optional[str] = None
+) -> List[MatchSummary]:
     """Parse raw Volleymetrics matches payload into MatchSummary objects."""
     matches: List[MatchSummary] = []
     if not data:
@@ -613,26 +657,69 @@ def parse_matches_response(data: Any) -> List[MatchSummary]:
             continue
 
         date_val = item.get("date") or item.get("matchDate") or item.get("startTime")
-        opponent = (
-            item.get("opponentName")
-            or item.get("opponent")
-            or item.get("awayTeamName")
-            or item.get("homeTeamName")
-            or "Unknown Opponent"
-        )
-        if isinstance(opponent, dict):
-            opponent = opponent.get("name", "Unknown Opponent")
+
+        # Resolve Home and Away teams
+        home_obj = item.get("homeTeam") if isinstance(item.get("homeTeam"), dict) else {}
+        away_obj = item.get("awayTeam") if isinstance(item.get("awayTeam"), dict) else {}
+        home_name = home_obj.get("name") or item.get("homeTeamName") or "Home Team"
+        away_name = away_obj.get("name") or item.get("awayTeamName") or "Away Team"
+        home_id = str(home_obj.get("id") or "")
+        away_id = str(away_obj.get("id") or "")
+
+        home_away = None
+        opponent = None
+
+        if active_team_id:
+            tid_str = str(active_team_id).strip()
+            if home_id == tid_str:
+                opponent = away_name
+                home_away = "Home"
+            elif away_id == tid_str:
+                opponent = home_name
+                home_away = "Away"
+
+        if not opponent:
+            if home_obj and away_obj:
+                opponent = f"{home_name} vs {away_name}"
+            else:
+                opponent = (
+                    item.get("opponentName")
+                    or item.get("opponent")
+                    or item.get("awayTeamName")
+                    or item.get("homeTeamName")
+                    or "Unknown Opponent"
+                )
+                if isinstance(opponent, dict):
+                    opponent = opponent.get("name", "Unknown Opponent")
 
         result = item.get("result") or item.get("matchResult")
         score = item.get("score") or item.get("setScore")
+        if not score and item.get("scores"):
+            score = str(item.get("scores"))
 
         # Set scores
         set_scores_raw = item.get("setScores") or item.get("scores") or []
         set_scores = [str(s) for s in set_scores_raw] if isinstance(set_scores_raw, list) else []
 
-        status = item.get("status") or item.get("analysisStatus") or "Final"
-        has_dvw = bool(item.get("hasDvw") or item.get("dvwFileId") or item.get("dvwAvailable") or "dvw" in str(item).lower())
-        has_analysis = bool(item.get("hasAnalysis") or item.get("analyzed") or status.lower() == "complete")
+        status = item.get("status") or item.get("analysisStatus")
+        extra_data = item.get("extraData", {}) if isinstance(item.get("extraData"), dict) else {}
+        video_status = extra_data.get("videoStatus", {}) if isinstance(extra_data.get("videoStatus"), dict) else {}
+        if not status and video_status.get("status"):
+            status = video_status.get("status")
+
+        has_dvw = bool(
+            item.get("hasDvw")
+            or item.get("dvwFileId")
+            or item.get("dvwAvailable")
+            or item.get("scoresheetId")
+            or (video_status.get("status") == "COMPLETE")
+            or "dvw" in str(item).lower()
+        )
+        has_analysis = bool(
+            item.get("hasAnalysis")
+            or item.get("analyzed")
+            or (status and str(status).lower() in ("complete", "analyzed", "verified"))
+        )
 
         matches.append(
             MatchSummary(
@@ -640,6 +727,7 @@ def parse_matches_response(data: Any) -> List[MatchSummary]:
                 date=str(date_val) if date_val else None,
                 opponent_name=str(opponent),
                 result=str(result) if result else None,
+                home_away=home_away,
                 score=str(score) if score else None,
                 set_scores=set_scores,
                 status=str(status) if status else None,
@@ -657,12 +745,137 @@ def parse_player_stats_response(data: Any, team: Optional[str] = None) -> List[P
     if not data:
         return players
 
-    # Can be a list of players or a dict containing player arrays
+    # 1. If data is full analysis payload containing 'sets', aggregate touches into athlete box scores
+    if isinstance(data, dict) and "sets" in data and isinstance(data["sets"], list):
+        home_tid = str(data.get("homeTeamId") or "")
+        away_tid = str(data.get("awayTeamId") or "")
+        agg: Dict[str, Dict[str, Any]] = {}
+        sets_played_per_player: Dict[str, set] = {}
+
+        for s_idx, s in enumerate(data["sets"], start=1):
+            set_num = s.get("setNum") or s_idx
+            for r in s.get("rallies", []):
+                for e in r.get("events", []):
+                    if not isinstance(e, dict):
+                        continue
+
+                    e_tid = str(e.get("teamId") or "")
+                    if team:
+                        target_t = str(team).lower().strip()
+                        if target_t in ("a", "home") and e_tid != home_tid:
+                            continue
+                        elif target_t in ("b", "away") and e_tid != away_tid:
+                            continue
+                        elif target_t in (home_tid.lower(), away_tid.lower()) and target_t != e_tid.lower():
+                            continue
+
+                    p = e.get("player") or {}
+                    p_num = str(p.get("number") or "")
+                    p_first = p.get("firstName") or ""
+                    p_last = p.get("lastName") or ""
+                    p_name = f"{p_first} {p_last}".strip() or p.get("name") or "Unknown"
+                    p_id = str(p.get("portalPlayerId") or p.get("id") or p_num or p_name)
+
+                    if p_id not in agg:
+                        agg[p_id] = {
+                            "id": p_id,
+                            "number": p_num,
+                            "name": p_name,
+                            "position": str(p.get("position") or ""),
+                            "kills": 0,
+                            "errors": 0,
+                            "attacks": 0,
+                            "assists": 0,
+                            "aces": 0,
+                            "serve_errors": 0,
+                            "total_serves": 0,
+                            "digs": 0,
+                            "receptions": 0,
+                            "perfect_passes": 0,
+                            "positive_passes": 0,
+                            "medium_passes": 0,
+                            "reception_errors": 0,
+                            "block_solos": 0,
+                            "block_assists": 0,
+                        }
+                        sets_played_per_player[p_id] = set()
+
+                    sets_played_per_player[p_id].add(set_num)
+
+                    act = (e.get("type", {}).get("description") if isinstance(e.get("type"), dict) else str(e.get("type") or "")).lower()
+                    grade = str(e.get("grade") or "").lower().strip()
+
+                    if "attack" in act or "spike" in act:
+                        agg[p_id]["attacks"] += 1
+                        if grade in ("#", "kill", "point"):
+                            agg[p_id]["kills"] += 1
+                        elif grade in ("=", "error", "blocked"):
+                            agg[p_id]["errors"] += 1
+                    elif "serve" in act:
+                        agg[p_id]["total_serves"] += 1
+                        if grade in ("#", "ace", "point"):
+                            agg[p_id]["aces"] += 1
+                        elif grade in ("=", "error"):
+                            agg[p_id]["serve_errors"] += 1
+                    elif "receive" in act or "pass" in act:
+                        agg[p_id]["receptions"] += 1
+                        if grade in ("#", "perfect", "3"):
+                            agg[p_id]["perfect_passes"] += 1
+                        elif grade in ("+", "positive", "2"):
+                            agg[p_id]["positive_passes"] += 1
+                        elif grade in ("!", "medium", "1", "in_play", "in-play"):
+                            agg[p_id]["medium_passes"] += 1
+                        elif grade in ("=", "error", "0"):
+                            agg[p_id]["reception_errors"] += 1
+                    elif "dig" in act or "cover" in act:
+                        agg[p_id]["digs"] += 1
+                    elif "block" in act:
+                        if grade in ("#", "point", "kill"):
+                            agg[p_id]["block_solos"] += 1
+                        elif grade in ("+", "positive", "touch"):
+                            agg[p_id]["block_assists"] += 1
+                    elif "set" in act:
+                        if grade in ("#", "assist", "+"):
+                            agg[p_id]["assists"] += 1
+
+        for p_id, stat in agg.items():
+            if stat["attacks"] == 0 and stat["total_serves"] == 0 and stat["receptions"] == 0 and stat["digs"] == 0 and stat["block_solos"] == 0:
+                continue
+
+            players.append(
+                PlayerStats(
+                    player_id=stat["id"],
+                    jersey_number=stat["number"],
+                    player_name=stat["name"],
+                    position=stat["position"],
+                    sets_played=len(sets_played_per_player.get(p_id, set())),
+                    kills=stat["kills"],
+                    attack_errors=stat["errors"],
+                    total_attacks=stat["attacks"],
+                    assists=stat["assists"],
+                    aces=stat["aces"],
+                    serve_errors=stat["serve_errors"],
+                    total_serves=stat["total_serves"],
+                    digs=stat["digs"],
+                    receptions=stat["receptions"],
+                    perfect_passes=stat["perfect_passes"],
+                    positive_passes=stat["positive_passes"],
+                    medium_passes=stat["medium_passes"],
+                    reception_errors=stat["reception_errors"],
+                    block_solos=stat["block_solos"],
+                    block_assists=stat["block_assists"],
+                )
+            )
+
+        # Sort by points descending
+        players.sort(key=lambda p: p.points or 0, reverse=True)
+        return players
+
+    # 2. Can be a list of players or a dict containing player arrays
     raw_players = []
     if isinstance(data, list):
         raw_players = data
     elif isinstance(data, dict):
-        # Could be { "players": [...] } or { "boxScore": [...] } or team keyed
         if "players" in data:
             raw_players = data["players"]
         elif "boxScore" in data:
@@ -685,29 +898,20 @@ def parse_player_stats_response(data: Any, team: Optional[str] = None) -> List[P
         pos = str(p.get("position") or p.get("pos") or "")
         sets = int(p.get("setsPlayed") or p.get("sets") or 0)
 
-        # Attacking
         kills = int(p.get("kills") or p.get("k") or 0)
         errors = int(p.get("attackErrors") or p.get("errors") or p.get("e") or 0)
         attacks = int(p.get("totalAttacks") or p.get("attacks") or p.get("ta") or 0)
-
-        # Setting
         assists = int(p.get("assists") or p.get("ast") or p.get("a") or 0)
         bhe = int(p.get("ballHandlingErrors") or p.get("bhe") or 0)
-
-        # Serving
         aces = int(p.get("serviceAces") or p.get("aces") or p.get("sa") or 0)
         se = int(p.get("serviceErrors") or p.get("serveErrors") or p.get("se") or 0)
         serves = int(p.get("totalServes") or p.get("serves") or 0)
-
-        # Defense & Passing
         digs = int(p.get("digs") or p.get("d") or 0)
         receptions = int(p.get("receptions") or p.get("rec") or p.get("receptionAttempts") or 0)
         perf_pass = int(p.get("perfectPasses") or p.get("quality3Passes") or 0)
         pos_pass = int(p.get("positivePasses") or p.get("quality2Passes") or 0)
         med_pass = int(p.get("mediumPasses") or p.get("quality1Passes") or 0)
         rec_err = int(p.get("receptionErrors") or p.get("re") or 0)
-
-        # Blocking
         bs = int(p.get("blockSolos") or p.get("bs") or 0)
         ba = int(p.get("blockAssists") or p.get("ba") or 0)
         be = int(p.get("blockErrors") or p.get("be") or 0)
@@ -748,6 +952,133 @@ def parse_rotation_stats_response(data: Any, team: Optional[str] = None) -> List
     if not data:
         return rotations
 
+    # 1. If data is full analysis payload containing 'sets', compute P1-P6 sideout & scoring stats
+    if isinstance(data, dict) and "sets" in data and isinstance(data["sets"], list):
+        home_tid = str(data.get("homeTeamId") or "")
+        away_tid = str(data.get("awayTeamId") or "")
+
+        target_is_home = True
+        if team:
+            t_str = str(team).lower().strip()
+            if t_str in ("b", "away") or (away_tid and t_str == away_tid):
+                target_is_home = False
+            elif t_str in ("a", "home") or (home_tid and t_str == home_tid):
+                target_is_home = True
+
+        target_team_id = home_tid if target_is_home else away_tid
+
+        # Initialize P1..P6 accumulators
+        p_stats: Dict[int, Dict[str, Any]] = {
+            rot: {
+                "sideouts_earned": 0,
+                "sideout_attempts": 0,
+                "points_scored_serving": 0,
+                "serve_attempts": 0,
+                "first_ball_sideouts": 0,
+                "setter_tendencies": {},
+            }
+            for rot in range(1, 7)
+        }
+
+        for s in data["sets"]:
+            rallies = s.get("rallies", [])
+            for r_idx, r in enumerate(rallies):
+                events = r.get("events", [])
+                if not events:
+                    continue
+
+                rot_val = r.get("homeSetterRotation" if target_is_home else "awaySetterRotation")
+                try:
+                    rot_num = int(rot_val) if rot_val is not None else 1
+                except (ValueError, TypeError):
+                    rot_num = 1
+                rot_num = max(1, min(6, rot_num))
+
+                # Identify serving team from first serve event or first touch
+                serving_tid = None
+                for e in events:
+                    act_desc = (e.get("type", {}).get("description") if isinstance(e.get("type"), dict) else str(e.get("type") or "")).lower()
+                    if "serve" in act_desc:
+                        serving_tid = str(e.get("teamId") or "")
+                        break
+                if not serving_tid and events:
+                    serving_tid = str(events[0].get("teamId") or "")
+
+                is_serving = (serving_tid == target_team_id)
+
+                # Determine winning team of rally
+                winning_tid = None
+                if r_idx + 1 < len(rallies):
+                    next_r = rallies[r_idx + 1]
+                    h_curr, a_curr = r.get("homeScore", 0) or 0, r.get("awayScore", 0) or 0
+                    h_next, a_next = next_r.get("homeScore", 0) or 0, next_r.get("awayScore", 0) or 0
+                    if h_next > h_curr:
+                        winning_tid = home_tid
+                    elif a_next > a_curr:
+                        winning_tid = away_tid
+
+                if not winning_tid:
+                    last_e = events[-1]
+                    last_act = (last_e.get("type", {}).get("description") if isinstance(last_e.get("type"), dict) else str(last_e.get("type") or "")).lower()
+                    last_grade = str(last_e.get("grade") or "").lower().strip()
+                    last_tid = str(last_e.get("teamId") or "")
+                    opp_tid = away_tid if last_tid == home_tid else home_tid
+
+                    if last_grade in ("#", "kill", "point", "ace") or "block" in last_act:
+                        winning_tid = last_tid
+                    elif last_grade in ("=", "error") or "error" in last_act:
+                        winning_tid = opp_tid
+                    else:
+                        winning_tid = last_tid
+
+                won_rally = (winning_tid == target_team_id)
+
+                if is_serving:
+                    p_stats[rot_num]["serve_attempts"] += 1
+                    if won_rally:
+                        p_stats[rot_num]["points_scored_serving"] += 1
+                else:
+                    p_stats[rot_num]["sideout_attempts"] += 1
+                    if won_rally:
+                        p_stats[rot_num]["sideouts_earned"] += 1
+                        if len(events) <= 3:
+                            p_stats[rot_num]["first_ball_sideouts"] += 1
+
+                # Track setter distribution in rotation
+                for e in events:
+                    if str(e.get("teamId") or "") == target_team_id:
+                        act_desc = (e.get("type", {}).get("description") if isinstance(e.get("type"), dict) else str(e.get("type") or "")).lower()
+                        if "attack" in act_desc or "spike" in act_desc:
+                            p_obj = e.get("player") or {}
+                            p_name = p_obj.get("lastName") or p_obj.get("name") or str(p_obj.get("number") or "Hitter")
+                            p_stats[rot_num]["setter_tendencies"][p_name] = p_stats[rot_num]["setter_tendencies"].get(p_name, 0) + 1
+
+        for rot_num in range(1, 7):
+            st = p_stats[rot_num]
+            so_att = st["sideout_attempts"]
+            so_pct = round(st["sideouts_earned"] / so_att, 4) if so_att > 0 else 0.0
+            srv_att = st["serve_attempts"]
+            ps_pct = round(st["points_scored_serving"] / srv_att, 4) if srv_att > 0 else 0.0
+            fbso_rate = round(st["first_ball_sideouts"] / so_att, 4) if so_att > 0 else 0.0
+
+            rotations.append(
+                RotationStats(
+                    rotation_number=rot_num,
+                    rotation_name=f"P{rot_num}",
+                    sideout_percentage=so_pct,
+                    sideouts_earned=st["sideouts_earned"],
+                    sideout_attempts=so_att,
+                    point_scoring_percentage=ps_pct,
+                    points_scored_serving=st["points_scored_serving"],
+                    serve_attempts=srv_att,
+                    first_ball_sideout_rate=fbso_rate,
+                    setter_tendencies=st["setter_tendencies"],
+                )
+            )
+
+        return rotations
+
+    # 2. Existing raw rotation array parsing
     raw_rotations = []
     if isinstance(data, list):
         raw_rotations = data
@@ -819,7 +1150,55 @@ def parse_video_actions(
     if isinstance(data, list):
         raw_events = data
     elif isinstance(data, dict):
-        raw_events = data.get("actions") or data.get("touches") or data.get("events") or []
+        if "sets" in data and isinstance(data["sets"], list):
+            home_tid = str(data.get("homeTeamId") or "")
+            away_tid = str(data.get("awayTeamId") or "")
+            home_name = data.get("homeTeam", {}).get("name") if isinstance(data.get("homeTeam"), dict) else "Home"
+            away_name = data.get("awayTeam", {}).get("name") if isinstance(data.get("awayTeam"), dict) else "Away"
+
+            for s_idx, s in enumerate(data["sets"], start=1):
+                set_num = int(s.get("setNum") or s_idx)
+                for r in s.get("rallies", []):
+                    rally_id = r.get("id") or r.get("rallyId")
+                    score_str = f"{r.get('homeScore', 0)}-{r.get('awayScore', 0)}"
+                    h_rot = r.get("homeSetterRotation")
+                    a_rot = r.get("awaySetterRotation")
+
+                    for e in r.get("events", []):
+                        if not isinstance(e, dict):
+                            continue
+                        e_tid = str(e.get("teamId") or "")
+                        t_code = "a" if e_tid == home_tid else ("b" if e_tid == away_tid else "a")
+                        t_name = home_name if t_code == "a" else away_name
+
+                        p = e.get("player") or {}
+                        p_first = p.get("firstName") or ""
+                        p_last = p.get("lastName") or ""
+                        p_name = f"{p_first} {p_last}".strip() or p.get("name") or ""
+                        p_num = str(p.get("number") or "")
+
+                        act_desc = e.get("type", {}).get("description") if isinstance(e.get("type"), dict) else str(e.get("type") or "")
+                        grade = str(e.get("grade") or "")
+
+                        raw_events.append({
+                            "id": e.get("id"),
+                            "rallyId": rally_id,
+                            "setNumber": set_num,
+                            "score": score_str,
+                            "team": t_code,
+                            "teamName": t_name,
+                            "playerId": str(p.get("portalPlayerId") or p.get("id") or ""),
+                            "playerName": p_name,
+                            "jerseyNumber": p_num,
+                            "actionType": act_desc,
+                            "quality": grade,
+                            "timestampSeconds": e.get("videoStartTime") or e.get("timestamp"),
+                            "sourceZone": e.get("xCoordinate"),
+                            "destZone": e.get("destXCoordinate"),
+                            "details": f"Rotation H:P{h_rot} A:P{a_rot}" if (h_rot or a_rot) else None,
+                        })
+        else:
+            raw_events = data.get("actions") or data.get("touches") or data.get("events") or []
 
     for idx, e in enumerate(raw_events):
         if not isinstance(e, dict):

@@ -96,17 +96,6 @@ def get_team_id_from_auth_state(auth_state_path: Optional[Path] = None) -> Optio
                                 return str(tid)
                         except Exception:
                             pass
-                    elif item.get("name") == "vmPortalUser":
-                        try:
-                            user_val = json.loads(item.get("value", "{}"))
-                            acc_id = user_val.get("activeAccountId")
-                            if acc_id:
-                                fallback_acc_id = str(acc_id)
-                        except Exception:
-                            pass
-
-        if fallback_acc_id:
-            return fallback_acc_id
     except Exception:
         pass
 
@@ -277,18 +266,44 @@ async def interactive_login(
                     "error": "Reached Volleymetrics portal, but no session token could be captured.",
                 }
 
-            # 6. Update environment and .env
+            # 6. Resolve genuine team ID from /acct/accounts if needed
+            detected_team_name = None
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as http_client:
+                    resp = await http_client.get(
+                        "https://api.volleymetrics.hudl.com/acct/accounts",
+                        headers={
+                            "Authorization": f"Bearer {captured_token}",
+                            "User-Agent": user_agent,
+                        },
+                    )
+                    if resp.status_code == 200:
+                        acc_data = resp.json()
+                        items = acc_data if isinstance(acc_data, list) else acc_data.get("accounts", [])
+                        if items:
+                            first_item = items[0]
+                            team_obj = first_item.get("team") if isinstance(first_item.get("team"), dict) else first_item
+                            real_tid = str(team_obj.get("id") or first_item.get("teamId") or "")
+                            if real_tid:
+                                captured_team_id = real_tid
+                            detected_team_name = team_obj.get("name") or first_item.get("name")
+            except Exception:
+                pass
+
+            # 7. Update environment and .env
             os.environ["VOLLEYMETRICS_TOKEN"] = captured_token
             if captured_team_id:
                 os.environ["VOLLEYMETRICS_TEAM_ID"] = captured_team_id
 
             env_file = find_env_file()
-            if env_file.is_file():
-                env_text = env_file.read_text(encoding="utf-8")
-                if "VOLLEYMETRICS_TOKEN=" in env_text:
-                    update_env_file("VOLLEYMETRICS_TOKEN", captured_token, env_path=env_file)
+            try:
+                update_env_file("VOLLEYMETRICS_TOKEN", captured_token, env_path=env_file)
+                if captured_team_id:
+                    update_env_file("VOLLEYMETRICS_TEAM_ID", captured_team_id, env_path=env_file)
+            except Exception:
+                pass
 
-            # 7. Securely cache in OS Keyring
+            # 8. Securely cache in OS Keyring
             try:
                 from volleymetrics_mcp.security import save_secure_session
                 save_secure_session(captured_token, team_id=captured_team_id)
@@ -300,7 +315,10 @@ async def interactive_login(
                 if len(captured_token) > 25
                 else "***"
             )
-            team_info_str = f"- **Detected Team ID**: `{captured_team_id}`\n" if captured_team_id else ""
+            team_info_str = ""
+            if captured_team_id:
+                name_part = f" ({detected_team_name})" if detected_team_name else ""
+                team_info_str = f"- **Detected Team**: `{captured_team_id}`{name_part}\n"
 
             return {
                 "success": True,

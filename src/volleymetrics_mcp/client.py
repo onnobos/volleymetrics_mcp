@@ -313,8 +313,9 @@ class VolleymetricsClient:
                 pass
 
         if teams:
-            if not active_tid:
-                first_tid = teams[0].team_id
+            team_ids = [str(t.team_id) for t in teams]
+            if not active_tid or str(active_tid) not in team_ids:
+                first_tid = str(teams[0].team_id)
                 os.environ["VOLLEYMETRICS_TEAM_ID"] = first_tid
                 self.team_id = first_tid
             set_cached_response(cache_key, [t.model_dump() for t in teams], TTL_SCHEDULE_TEAM)
@@ -324,17 +325,24 @@ class VolleymetricsClient:
     async def resolve_active_team_id(
         self, force_refresh: bool = False, client: Optional[httpx.AsyncClient] = None
     ) -> Optional[str]:
-        """Resolve active team ID from environment or auto-detected teams."""
+        """Resolve active team ID from user teams, environment, or keyring."""
+        teams = await self.get_user_teams(force_refresh=force_refresh, client=client)
+        if teams:
+            first_tid = str(teams[0].team_id)
+            os.environ["VOLLEYMETRICS_TEAM_ID"] = first_tid
+            self.team_id = first_tid
+            try:
+                from volleymetrics_mcp.security import get_secure_token, save_secure_session
+                tok = get_secure_token()
+                if tok:
+                    save_secure_session(tok, team_id=first_tid)
+            except Exception:
+                pass
+            return first_tid
+
         tid = self.team_id or get_volleymetrics_team_id()
         if tid:
             return tid
-
-        teams = await self.get_user_teams(force_refresh=force_refresh, client=client)
-        if teams:
-            first_tid = teams[0].team_id
-            os.environ["VOLLEYMETRICS_TEAM_ID"] = first_tid
-            self.team_id = first_tid
-            return first_tid
 
         return None
 
@@ -346,7 +354,7 @@ class VolleymetricsClient:
         client: Optional[httpx.AsyncClient] = None,
     ) -> List[MatchSummary]:
         """Fetch schedule and recent matches for a team from Volleymetrics (cached 15m)."""
-        resolved_tid = team_id or self.team_id or await self.resolve_active_team_id(force_refresh=force_refresh, client=client)
+        resolved_tid = team_id or await self.resolve_active_team_id(force_refresh=force_refresh, client=client) or self.team_id
         if not resolved_tid:
             raise VolleymetricsError(
                 "No team_id provided and could not resolve an active team. "
@@ -361,23 +369,45 @@ class VolleymetricsClient:
 
         matches: List[MatchSummary] = []
 
-        # Try /portal/matches/team/{teamId}/matches
+        # 1. Try portal/events/mine (user's scheduled and analyzed matches)
         try:
-            path = f"portal/matches/team/{resolved_tid}/matches"
-            resp = await self._send_request("GET", path, client=client)
+            params = {
+                "page": 1,
+                "size": limit,
+                "sort": "matchDate,desc",
+                "matchType": "match",
+            }
+            resp = await self._send_request("GET", "portal/events/mine", params=params, client=client)
             if resp.status_code == 200:
-                matches = parse_matches_response(resp.json())
+                matches = parse_matches_response(resp.json(), active_team_id=resolved_tid)
         except VolleymetricsAuthError:
             raise
         except Exception:
             pass
 
-        # Fallback to /portal/matches
+        # 2. Try portal/events with teamId
+        if not matches:
+            try:
+                params = {
+                    "page": 1,
+                    "size": limit,
+                    "teamId": resolved_tid,
+                    "sort": "matchDate,desc",
+                }
+                resp = await self._send_request("GET", "portal/events", params=params, client=client)
+                if resp.status_code == 200:
+                    matches = parse_matches_response(resp.json(), active_team_id=resolved_tid)
+            except VolleymetricsAuthError:
+                raise
+            except Exception:
+                pass
+
+        # 3. Fallback to /portal/matches
         if not matches:
             try:
                 resp = await self._send_request("GET", "portal/matches", params={"teamId": resolved_tid}, client=client)
                 if resp.status_code == 200:
-                    matches = parse_matches_response(resp.json())
+                    matches = parse_matches_response(resp.json(), active_team_id=resolved_tid)
             except VolleymetricsAuthError:
                 raise
             except Exception:

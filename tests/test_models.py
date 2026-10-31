@@ -237,3 +237,135 @@ def test_parsers():
     attack_actions = parse_video_actions(raw_touches, action_type="attack")
     assert len(attack_actions) == 1
     assert attack_actions[0].action_type == "attack"
+
+
+def test_full_analysis_sets_parser():
+    """Verify parsing sets, rallies, and events into player stats, rotation stats, and touches."""
+    analysis_payload = {
+        "homeTeamId": "100",
+        "awayTeamId": "200",
+        "homeTeam": {"id": "100", "name": "Stanford"},
+        "awayTeam": {"id": "200", "name": "Texas"},
+        "sets": [
+            {
+                "setNum": 1,
+                "homeScore": 25,
+                "awayScore": 20,
+                "rallies": [
+                    {
+                        "id": "r1",
+                        "homeScore": 0,
+                        "awayScore": 0,
+                        "homeSetterRotation": 1,
+                        "awaySetterRotation": 4,
+                        "events": [
+                            {
+                                "id": "e1",
+                                "teamId": "100",
+                                "type": {"description": "serve"},
+                                "grade": "+",
+                                "player": {"portalPlayerId": "p1", "number": "7", "firstName": "Kathryn", "lastName": "Plummer"},
+                                "videoStartTime": 12.5,
+                            },
+                            {
+                                "id": "e2",
+                                "teamId": "200",
+                                "type": {"description": "receive"},
+                                "grade": "!",
+                                "player": {"portalPlayerId": "p2", "number": "2", "firstName": "Logan", "lastName": "Eggleston"},
+                                "videoStartTime": 14.0,
+                            },
+                            {
+                                "id": "e3",
+                                "teamId": "200",
+                                "type": {"description": "attack"},
+                                "grade": "=",  # Attack error -> Stanford (home) wins rally
+                                "player": {"portalPlayerId": "p2", "number": "2", "firstName": "Logan", "lastName": "Eggleston"},
+                                "videoStartTime": 16.2,
+                            },
+                        ],
+                    },
+                    {
+                        "id": "r2",
+                        "homeScore": 1,
+                        "awayScore": 0,
+                        "homeSetterRotation": 1,
+                        "awaySetterRotation": 4,
+                        "events": [
+                            {
+                                "id": "e4",
+                                "teamId": "100",
+                                "type": {"description": "serve"},
+                                "grade": "#",  # Ace -> Stanford scores serving point
+                                "player": {"portalPlayerId": "p1", "number": "7", "firstName": "Kathryn", "lastName": "Plummer"},
+                                "videoStartTime": 25.0,
+                            },
+                        ],
+                    },
+                    {
+                        "id": "r3",
+                        "homeScore": 2,
+                        "awayScore": 0,
+                        "homeSetterRotation": 2,
+                        "awaySetterRotation": 4,
+                        "events": [
+                            {
+                                "id": "e5",
+                                "teamId": "200",
+                                "type": {"description": "serve"},
+                                "grade": "+",
+                                "player": {"portalPlayerId": "p2", "number": "2", "firstName": "Logan", "lastName": "Eggleston"},
+                                "videoStartTime": 40.0,
+                            },
+                            {
+                                "id": "e6",
+                                "teamId": "100",
+                                "type": {"description": "receive"},
+                                "grade": "#",  # Perfect pass
+                                "player": {"portalPlayerId": "p3", "number": "1", "firstName": "Morgan", "lastName": "Hentz"},
+                                "videoStartTime": 41.5,
+                            },
+                            {
+                                "id": "e7",
+                                "teamId": "100",
+                                "type": {"description": "attack"},
+                                "grade": "#",  # Kill -> Stanford earns sideout
+                                "player": {"portalPlayerId": "p1", "number": "7", "firstName": "Kathryn", "lastName": "Plummer"},
+                                "videoStartTime": 43.0,
+                            },
+                        ],
+                    },
+                ],
+            }
+        ],
+    }
+
+    # 1. Test Player Stats aggregation
+    players = parse_player_stats_response(analysis_payload, team="100")
+    assert len(players) >= 1
+    plummer = next(p for p in players if "Plummer" in p.player_name)
+    assert plummer.kills == 1
+    assert plummer.aces == 1
+    assert plummer.total_serves == 2
+
+    # 2. Test Rotation Stats aggregation
+    rotations = parse_rotation_stats_response(analysis_payload, team="100")
+    assert len(rotations) == 6
+    p1 = next(r for r in rotations if r.rotation_number == 1)
+    assert p1.serve_attempts == 2
+    assert p1.points_scored_serving == 2
+    assert p1.point_scoring_percentage == 1.0
+
+    p2 = next(r for r in rotations if r.rotation_number == 2)
+    assert p2.sideout_attempts == 1
+    assert p2.sideouts_earned == 1
+    assert p2.sideout_percentage == 1.0
+    assert p2.first_ball_sideout_rate == 1.0
+
+    # 3. Test Video Actions parsing
+    actions = parse_video_actions(analysis_payload, limit=10)
+    assert len(actions) == 7
+    assert actions[0].action_type == "serve"
+    assert actions[0].player_label == "#7 Kathryn Plummer"
+    assert actions[0].score == "0-0"
+    assert actions[0].team == "a"
