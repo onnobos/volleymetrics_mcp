@@ -37,6 +37,8 @@ htmlcov/
 .env.local
 .volleymetrics_mcp/
 auth_state.json
+*.dvw
+*.log
 
 # IDE
 .idea/

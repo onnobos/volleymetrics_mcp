@@ -9,8 +9,9 @@ description = "Production-grade Model Context Protocol (MCP) server for Volleyme
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [
-    { name = "Volleymetrics MCP Team" }
+    { name = "Onno Bos" }
 ]
+urls = { "Homepage" = "https://github.com/onnobos/volleymetrics_mcp", "Repository" = "https://github.com/onnobos/volleymetrics_mcp", "Issues" = "https://github.com/onnobos/volleymetrics_mcp/issues" }
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
