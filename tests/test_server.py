@@ -17,6 +17,7 @@ from volleymetrics_mcp.server import (
     login_to_volleymetrics,
     match_mvp_breakdown,
     refresh_volleymetrics_cookie,
+    refresh_volleymetrics_session,
     scout_opponent,
     serve_receive_audit,
 )
@@ -200,3 +201,22 @@ def test_prompts_generation():
 
     audit = serve_receive_audit("m-999")
     assert "Passing & Receiving Specialist" in audit
+
+
+@pytest.mark.asyncio
+async def test_refresh_volleymetrics_session_and_cookie_alias():
+    """Verify refresh_volleymetrics_session and backwards-compatible alias behave consistently."""
+    with patch("volleymetrics_mcp.server.refresh_session", new_callable=AsyncMock) as mock_refresh, \
+         patch.dict("os.environ", {"VOLLEYMETRICS_EMAIL": "coach@team.edu", "VOLLEYMETRICS_PASSWORD": "secret"}):
+        mock_refresh.return_value = {
+            "success": True,
+            "masked_token": "eyJhbGciOi...1234",
+        }
+        res_session = await refresh_volleymetrics_session()
+        assert "Session Refreshed Successfully" in res_session
+        assert "eyJhbGciOi...1234" in res_session
+
+        res_cookie = await refresh_volleymetrics_cookie()
+        assert "Session Refreshed Successfully" in res_cookie
+        assert "eyJhbGciOi...1234" in res_cookie
+

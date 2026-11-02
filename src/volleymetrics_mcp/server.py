@@ -7,9 +7,12 @@ scores, rotation breakdowns (P1-P6), play-by-play touches, and official DataVoll
 
 from __future__ import annotations
 
+import inspect
 import os
-from typing import Annotated, Optional
+from typing import Annotated, Any, Callable, Literal, Optional, TypeVar
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
+from pydantic import Field
 
 from volleymetrics_mcp.auth_refresh import interactive_login, refresh_session
 from volleymetrics_mcp.cache import clear_all_cache
@@ -29,45 +32,95 @@ from volleymetrics_mcp.models import (
     render_teams_output,
 )
 
-# Initialize FastMCP Server
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def _clean_docstring(fn: F) -> F:
+    """Normalize function docstring indentation via inspect.cleandoc before MCP registration."""
+    if fn.__doc__:
+        fn.__doc__ = inspect.cleandoc(fn.__doc__)
+    return fn
+
+
+# Initialize FastMCP Server with Coaching Workflow Routing Decision Matrix
 mcp = FastMCP(
     "volleymetrics-mcp",
     instructions=(
-        "Volleymetrics MCP Server connects to Volleymetrics and Hudl volleyball analytics APIs "
-        "to retrieve match schedules, athlete box scores, rotation breakdown statistics (P1-P6), "
-        "complete event-by-event volleyball touches with DataVolley (.dvw) skill and evaluation codes, "
-        "and official DataVolley (.dvw) file exports. "
-        "Use get_user_teams to discover your team ID automatically, list_volleyball_matches to find matches, "
-        "get_match_player_stats to analyze individual player box scores, get_rotation_breakdown to analyze P1-P6 efficiencies, "
-        "get_game_actions to query all tagged actions and touches (serves, passes, attacks, digs, sets, blocks), "
-        "download_match_dvw to generate official DataVolley files, "
-        "and login_to_volleymetrics to log in interactively via a pop-up browser window without storing passwords."
+        "Volleymetrics MCP provides read-only volleyball performance intelligence, match statistics, "
+        "tactical rotation analytics (P1-P6), tagged event-by-event touches, and DataVolley (.dvw) exports.\n\n"
+        "### Tool Selection & Routing Decision Matrix:\n"
+        "1. Team Identification: Call `get_user_teams` first if you do not know the user's `team_id` or need to discover available accounts.\n"
+        "2. Match Discovery: Call `list_volleyball_matches` to locate recent matches and acquire valid `match_id` strings (e.g. '771842').\n"
+        "3. Box Scores & Player Totals: Call `get_match_player_stats` for aggregate athlete stats (Kills, Errors, Attempts, Hit%, Aces, Digs, Blocks, Passing Avg).\n"
+        "4. Tactical Rotation Efficiency: Call `get_rotation_breakdown` for sideout % and point-scoring % across setter rotations P1 through P6.\n"
+        "5. Touch-by-Touch / Video Play-by-Play: Call `get_game_actions` for individual tagged touches (serves, passes, sets, attacks, digs, blocks) with DataVolley codes.\n"
+        "6. Official Scouting Files: Call `download_match_dvw` when the user requests an authentic .dvw file written to disk.\n"
+        "7. Interactive Authentication: If any tool returns an Authentication Error (401), call `login_to_volleymetrics` to open an interactive desktop browser window.\n"
+        "8. Headless Session Refresh: Call `refresh_volleymetrics_session` to refresh an existing OAuth token headlessly when `.env` credentials are configured."
     ),
 )
 
 
-@mcp.tool()
+@mcp.tool(
+    title="Get User Volleymetrics Teams",
+    annotations=ToolAnnotations(
+        title="Get User Volleymetrics Teams",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+    structured_output=False,
+)
+@_clean_docstring
 async def get_user_teams(
     output_format: Annotated[
-        str,
-        "Desired output representation: 'markdown' for human-readable table or 'compact' for token-efficient JSON",
+        Literal["markdown", "compact"],
+        Field(
+            default="markdown",
+            description=(
+                "Response representation format: 'markdown' returns a formatted Markdown table "
+                "for human display; 'compact' returns a token-minimized JSON object for downstream agent chaining."
+            ),
+            examples=["markdown", "compact"],
+        ),
     ] = "markdown",
     force_refresh: Annotated[
         bool,
-        "Bypass local 15-minute disk cache and force a live API fetch",
+        Field(
+            default=False,
+            description=(
+                "When True, bypasses the 15-minute local disk cache (~/.volleymetrics_mcp/cache) "
+                "and forces a live HTTPS GET request to the Volleymetrics user profile endpoint."
+            ),
+            examples=[False, True],
+        ),
     ] = False,
 ) -> str:
-    """Discover and list all Volleymetrics teams and accounts associated with your credentials.
+    """Retrieve all Volleymetrics volleyball team profiles and organization memberships linked to the authenticated account, unlike `list_volleyball_matches` (which lists match schedules for a single team).
 
-    Retrieves team names, team IDs, club/school organizations, conferences, roles,
-    and active status directly from your authenticated Volleymetrics account.
+    ### When to Use
+    - Discover the user's accessible `team_id` values, team names, school/club organizations, conferences, and coaching roles at the start of an analysis workflow.
+    - Verify which team is currently marked active before calling `list_volleyball_matches`.
 
-    Args:
-        output_format: Format of the output: 'markdown' (clean table) or 'compact' (token-efficient JSON).
-        force_refresh: If True, bypasses local 15-minute disk cache and forces a live fetch.
+    ### When NOT to Use
+    - Do NOT use to search for external opponent teams or public league rosters not tied to the user's account; call `list_volleyball_matches` to inspect opponents on your match schedule.
+    - Do NOT call before every match query once `team_id` is known, as `list_volleyball_matches` automatically resolves the active team when `team_id` is omitted.
 
-    Returns:
-        A formatted Markdown table or compact JSON dictionary of your teams.
+    ### Behavioral Guarantees & Caching
+    - **Execution Contract**: Strictly read-only, idempotent HTTPS `GET` against `https://api.volleymetrics.hudl.com`.
+    - **Caching Policy**: Cached on local disk (`~/.volleymetrics_mcp/cache`) with a 15-minute TTL (`900s`). Set `force_refresh=True` only after account membership changes.
+    - **Rate Limiting**: Governed by a client-side token bucket (`2 req/s`, burst capacity `4`) with exponential backoff on HTTP `429`/`5xx`.
+    - **Authentication**: Reads Bearer JWT credentials from `~/.volleymetrics_mcp/auth_state.json`, OS Keychain, or `.env`.
+
+    ### Parameter & Workflow Semantics
+    - Pass the `team_id` returned by this tool into `list_volleyball_matches`, `get_match_player_stats`, or `get_rotation_breakdown` when the user coaches multiple squads and wants to switch away from their default active team.
+    - Prefer `output_format='compact'` when chaining team discovery into automated multi-step tool calls to save context tokens.
+
+    ### Returns & Error States
+    - `'markdown'`: Markdown table with columns `Team ID`, `Team Name`, `School / Club`, `Conference`, `Role`, and `Active`.
+    - `'compact'`: JSON object `{"active_team_id": str, "count": int, "teams": [{"team_id": str, "name": str, "school_name": str, "conference": str, "role": str, "is_current": bool}]}`.
+    - On missing or expired credentials (HTTP `401`/`403`), returns an actionable `⚠️ Authentication Error` instructing the agent to invoke `login_to_volleymetrics`.
     """
     try:
         client = VolleymetricsClient()
@@ -90,39 +143,85 @@ async def get_user_teams(
         return f"Unexpected error while fetching user teams: {type(exc).__name__}: {exc}"
 
 
-@mcp.tool()
+@mcp.tool(
+    title="List Team Volleyball Matches",
+    annotations=ToolAnnotations(
+        title="List Team Volleyball Matches",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+    structured_output=False,
+)
+@_clean_docstring
 async def list_volleyball_matches(
     team_id: Annotated[
         Optional[str],
-        "Volleymetrics team identifier. If omitted, automatically resolves your active team ID.",
+        Field(
+            default=None,
+            description=(
+                "Volleymetrics team identifier (obtainable via get_user_teams). "
+                "When omitted or None, automatically resolves to the authenticated user's active team ID."
+            ),
+            examples=["10482", "team-city-volley-basel"],
+        ),
     ] = None,
     limit: Annotated[
         int,
-        "Maximum number of recent matches and video recordings to retrieve (default: 10)",
+        Field(
+            default=10,
+            ge=1,
+            le=50,
+            description="Maximum number of recent matches to return, ordered most-recent first (1 to 50).",
+            examples=[10, 25],
+        ),
     ] = 10,
     output_format: Annotated[
-        str,
-        "Output format: 'markdown' (table) or 'compact' (token-efficient JSON)",
+        Literal["markdown", "compact"],
+        Field(
+            default="markdown",
+            description=(
+                "Response representation format: 'markdown' returns a match schedule table; "
+                "'compact' returns a token-efficient JSON object for programmatic match_id extraction."
+            ),
+            examples=["markdown", "compact"],
+        ),
     ] = "markdown",
     force_refresh: Annotated[
         bool,
-        "Bypass local 15-minute disk cache and force a live API fetch",
+        Field(
+            default=False,
+            description="When True, bypasses the 15-minute local disk cache and fetches live match schedules from Volleymetrics.",
+            examples=[False, True],
+        ),
     ] = False,
 ) -> str:
-    """Fetch match schedule and recent games for a team from Volleymetrics.
+    """List recent volleyball match schedules, opponent names, set scores, and DataVolley (`.dvw`) availability for a team, serving as the primary match discovery step before calling `get_match_player_stats`, `get_rotation_breakdown`, `get_game_actions`, or `download_match_dvw`.
 
-    Returns a table or compact JSON containing match IDs, dates, opponent names, results,
-    set scores, and whether DataVolley (.dvw) files are available. Call this tool first when
-    analyzing team performance to discover match IDs for downstream analysis.
+    ### When to Use
+    - Discover valid `match_id` identifiers (e.g. `'771842'`) required by all match-level analytics and export tools.
+    - Review season win/loss records, set scores, match dates, opponent names, and whether video breakdown (`.dvw`) tagging is complete.
 
-    Args:
-        team_id: Optional Volleymetrics team ID. If omitted, uses auto-detected team ID.
-        limit: Maximum number of recent matches to retrieve (default: 10).
-        output_format: Output format: 'markdown' (table) or 'compact' (token-efficient JSON).
-        force_refresh: If True, bypasses local 15-minute disk cache and forces a live fetch.
+    ### When NOT to Use
+    - Do NOT use to retrieve athlete box scores or hitting percentages; pass a discovered `match_id` to `get_match_player_stats`.
+    - Do NOT use to evaluate P1–P6 sideout or point-scoring percentages; pass `match_id` to `get_rotation_breakdown`.
+    - Do NOT use to inspect individual rally touches; pass `match_id` to `get_game_actions`.
 
-    Returns:
-        A formatted table or compact JSON of matches or an actionable error message.
+    ### Behavioral Guarantees & Caching
+    - **Execution Contract**: Strictly read-only, idempotent HTTPS `GET` query.
+    - **Auto-Resolution**: When `team_id` is `None`, resolves the active team from `~/.volleymetrics_mcp/auth_state.json`, `.env`, or the user profile endpoint.
+    - **Caching Policy**: Cached on local disk for 15 minutes (`900s`). Set `force_refresh=True` when checking if a newly uploaded match has finished processing.
+    - **Rate Limiting**: Client token bucket (`2 req/s`, burst `4`) with automatic retry on HTTP `429`/`5xx`.
+
+    ### Parameter & Workflow Semantics
+    - Only matches where `has_dvw` (`DVW Ready`) is `True` contain full play-by-play event tags for `get_game_actions`, `get_rotation_breakdown`, and `download_match_dvw`.
+    - Increase `limit` (up to `50`) when aggregating full-season trends across all matches.
+
+    ### Returns & Error States
+    - `'markdown'`: Markdown table with columns `Match ID`, `Date`, `Opponent`, `Result`, `Set Scores`, `Season`, and `DVW Ready`.
+    - `'compact'`: JSON object `{"team_id": str, "count": int, "matches": [{"match_id": str, "date": str, "opponent": str, "result": str, "sets": [str], "season": str, "has_dvw": bool}]}`.
+    - Returns `⚠️ Authentication Error` on HTTP `401`/`403` (recover via `login_to_volleymetrics`).
     """
     try:
         client = VolleymetricsClient()
@@ -146,42 +245,81 @@ async def list_volleyball_matches(
         return f"Unexpected error while fetching matches: {type(exc).__name__}: {exc}"
 
 
-@mcp.tool()
+@mcp.tool(
+    title="Get Match Player Box Score",
+    annotations=ToolAnnotations(
+        title="Get Match Player Box Score",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+    structured_output=False,
+)
+@_clean_docstring
 async def get_match_player_stats(
     match_id: Annotated[
         str,
-        "Unique Volleymetrics match identifier (obtainable via list_volleyball_matches)",
+        Field(
+            description="Unique Volleymetrics match identifier obtained from list_volleyball_matches.",
+            examples=["771842", "m-100"],
+        ),
     ],
     team_id: Annotated[
         Optional[str],
-        "Optional Volleymetrics team ID to filter athlete statistics to a specific squad",
+        Field(
+            default=None,
+            description=(
+                "Optional Volleymetrics team ID (from get_user_teams) to restrict athlete box scores to one squad. "
+                "When omitted, returns athlete statistics for all participating players in the match."
+            ),
+            examples=["10482"],
+        ),
     ] = None,
     output_format: Annotated[
-        str,
-        "Desired output representation: 'markdown' for standard box score table or 'compact' for token-efficient JSON",
+        Literal["markdown", "compact"],
+        Field(
+            default="markdown",
+            description=(
+                "Response representation format: 'markdown' renders a standard volleyball box score table; "
+                "'compact' returns a token-efficient JSON array of athlete stat objects."
+            ),
+            examples=["markdown", "compact"],
+        ),
     ] = "markdown",
     force_refresh: Annotated[
         bool,
-        "Bypass local 7-day disk cache and force a live API fetch",
+        Field(
+            default=False,
+            description="When True, bypasses the 7-day local disk cache for historical match box scores and forces a live API fetch.",
+            examples=[False, True],
+        ),
     ] = False,
 ) -> str:
-    """Fetch individual athlete box scores and volleyball statistics for a match.
+    """Fetch aggregated athlete box scores and individual volleyball statistics (attacking, serving, passing, blocking, and digging totals) for a single match, unlike `get_rotation_breakdown` (team P1–P6 rotation efficiencies) or `get_game_actions` (chronological touch-by-touch events).
 
-    Retrieves player stats, strips unnecessary UI metadata, ensures hitting percentage
-    ((Kills - Errors) / Total Attacks) is accurately calculated, and formats the output
-    into a clean, standard volleyball box score table or compact JSON including Kills (K),
-    Attack Errors (E), Total Attacks (TA), Hitting % (Hit%), Assists (Ast), Service Aces (SA),
-    Service Errors (SE), Digs (Dig), Block Solos (BS), Block Assists (BA), Total Blocks (TB),
-    Total Points (Pts), Receptions (Rec), and Passing Average (Pass Avg).
+    ### When to Use
+    - Evaluate individual player performance in a match: Kills (`K`), Attack Errors (`E`), Total Attacks (`TA`), Hitting Percentage (`(K - E) / TA`), Assists (`Ast`), Service Aces (`SA`), Service Errors (`SE`), Receptions (`Rec`), Reception Errors (`RE`), Passing Average (`0.00`–`3.00` scale), Digs (`Dig`), Block Solos (`BS`), Block Assists (`BA`), Total Blocks (`TB`), and Total Points (`Pts`).
+    - Identify top scorers, pin/middle offensive efficiency, and primary serve-receive passers.
 
-    Args:
-        match_id: The unique Volleymetrics match identifier.
-        team_id: Optional team ID to filter stats to a specific squad.
-        output_format: Output format: 'markdown' (standard box score table) or 'compact' (token-efficient JSON).
-        force_refresh: If True, bypasses local 7-day disk cache and forces a live fetch.
+    ### When NOT to Use
+    - Do NOT use to analyze team sideout or point-scoring rates by setter rotation (P1–P6); call `get_rotation_breakdown` instead.
+    - Do NOT use to inspect individual rally touches, court zones, or set-by-set play sequences; call `get_game_actions` instead.
+    - Do NOT call with an unknown `match_id`; call `list_volleyball_matches` first.
 
-    Returns:
-        A formatted volleyball box score table or compact JSON.
+    ### Behavioral Guarantees & Caching
+    - **Execution Contract**: Strictly read-only, idempotent query.
+    - **Derived Metric Integrity**: Automatically computes zero-division-safe Hitting Percentage (`0.000` when `TA == 0`), Total Blocks (`BS + 0.5 * BA`), and Total Points (`K + SA + BS + 0.5 * BA`).
+    - **Caching Policy**: Historical match stats are cached on local disk for 7 days (`604800s`).
+    - **Rate Limiting**: Client token bucket (`2 req/s`, burst `4`) with exponential backoff.
+
+    ### Parameter & Workflow Semantics
+    - Combine `match_id` (from `list_volleyball_matches`) with `team_id` (from `get_user_teams`) when you want to isolate a single team's roster; leave `team_id=None` when comparing both teams head-to-head.
+
+    ### Returns & Error States
+    - `'markdown'`: Box score table with columns `#`, `Player`, `Pos`, `SP`, `K`, `E`, `TA`, `Hit%`, `Ast`, `SA`, `SE`, `Rec`, `RE`, `Pass Avg`, `Dig`, `BS`, `BA`, `TB`, and `Pts`.
+    - `'compact'`: JSON object `{"match_id": str, "player_count": int, "players": [{"name": str, "no": str, "pos": str, "sp": int, "k": int, "e": int, "ta": int, "hit_pct": float, "ast": int, "sa": int, "se": int, "rec": int, "re": int, "pass_avg": float, "dig": int, "bs": int, "ba": int, "tb": float, "pts": float}]}`.
+    - Returns validation error if `match_id` is empty, or `⚠️ Authentication Error` on HTTP `401`/`403`.
     """
     if not match_id or not match_id.strip():
         return "Error: 'match_id' parameter is required. Use 'list_volleyball_matches' to find match IDs."
@@ -208,39 +346,80 @@ async def get_match_player_stats(
         return f"Unexpected error while fetching player statistics: {type(exc).__name__}: {exc}"
 
 
-@mcp.tool()
+@mcp.tool(
+    title="Get Match Rotation Breakdown (P1-P6)",
+    annotations=ToolAnnotations(
+        title="Get Match Rotation Breakdown (P1-P6)",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+    structured_output=False,
+)
+@_clean_docstring
 async def get_rotation_breakdown(
     match_id: Annotated[
         str,
-        "Unique Volleymetrics match identifier (obtainable via list_volleyball_matches)",
+        Field(
+            description="Unique Volleymetrics match identifier obtained from list_volleyball_matches.",
+            examples=["771842", "m-100"],
+        ),
     ],
     team_id: Annotated[
         Optional[str],
-        "Optional Volleymetrics team ID to filter rotation analytics to a specific squad",
+        Field(
+            default=None,
+            description=(
+                "Optional Volleymetrics team ID (from get_user_teams) to filter P1-P6 rotation analytics to a specific squad. "
+                "When omitted, analyzes the default primary team in the match."
+            ),
+            examples=["10482"],
+        ),
     ] = None,
     output_format: Annotated[
-        str,
-        "Desired output representation: 'markdown' for P1-P6 sideout table or 'compact' for token-efficient JSON",
+        Literal["markdown", "compact"],
+        Field(
+            default="markdown",
+            description=(
+                "Response representation format: 'markdown' renders a P1-P6 tactical efficiency table; "
+                "'compact' returns a token-efficient JSON object."
+            ),
+            examples=["markdown", "compact"],
+        ),
     ] = "markdown",
     force_refresh: Annotated[
         bool,
-        "Bypass local 7-day disk cache and force a live API fetch",
+        Field(
+            default=False,
+            description="When True, bypasses the 7-day local disk cache and recalculates rotation metrics from live Volleymetrics data.",
+            examples=[False, True],
+        ),
     ] = False,
 ) -> str:
-    """Fetch tactical performance metrics broken down by volleyball rotation (P1 through P6).
+    """Fetch team tactical sideout, point-scoring, and first-ball sideout (FBSO) efficiencies broken down across setter rotations P1 through P6 for a match, unlike `get_match_player_stats` (individual player box scores) or `get_game_actions` (event-level rally touches).
 
-    Returns sideout efficiency (earned sideout points / total receive opportunities), point
-    scoring percentage while serving, first-ball sideout (FBSO) conversion rates, and
-    setter distribution tendencies for each rotation (P1 through P6).
+    ### When to Use
+    - Diagnose which setter rotation (`P1` through `P6`) is leaking sideout points or generating service scoring runs.
+    - Compare Sideout Percentage (`Sideout%`), First-Ball Sideout Percentage (`FBSO%`), Point Scoring Percentage (`Point Score%`), and Setter Distribution tendencies (`Left/OH`, `Middle`, `Right/Opp`, `Pipe/Backrow`) by rotation.
 
-    Args:
-        match_id: The unique Volleymetrics match identifier.
-        team_id: Optional team ID to filter breakdown to a specific squad.
-        output_format: Output format: 'markdown' (table) or 'compact' (token-efficient JSON).
-        force_refresh: If True, bypasses local 7-day disk cache and forces a live fetch.
+    ### When NOT to Use
+    - Do NOT use for individual athlete kill/dig/pass totals; call `get_match_player_stats` instead.
+    - Do NOT use to inspect which specific player committed reception or attack errors inside a weak rotation; call `get_game_actions` after identifying the rotation here.
 
-    Returns:
-        A formatted table or compact JSON of rotation analytics (P1 through P6).
+    ### Behavioral Guarantees & Caching
+    - **Execution Contract**: Strictly read-only, idempotent query.
+    - **Domain Conventions**: `P1`–`P6` denote the setter's starting court zone (`P1` = Zone 1 right-back, `P6` = Zone 6 middle-back, `P5` = Zone 5 left-back, `P4` = Zone 4 front-left, `P3` = Zone 3 front-center, `P2` = Zone 2 front-right).
+    - **Caching Policy**: Cached on local disk for 7 days (`604800s`).
+    - **Rate Limiting**: Client token bucket (`2 req/s`, burst `4`) with automatic retry.
+
+    ### Parameter & Workflow Semantics
+    - Typical coaching workflow: call `get_rotation_breakdown` first to find any rotation with `Sideout% < 50%`, then call `get_game_actions(match_id=..., action_type='receive', quality='error')` to pinpoint the exact breakdown cause.
+
+    ### Returns & Error States
+    - `'markdown'`: Table with columns `Rotation`, `SO Opp`, `SO Pts`, `Sideout%`, `FBSO%`, `Srv Opp`, `Srv Pts`, `Point Score%`, and `Setter Distribution`.
+    - `'compact'`: JSON object `{"match_id": str, "rotations": [{"rot": str, "so_opp": int, "so_pts": int, "so_pct": float, "fbso_pct": float, "ps_opp": int, "ps_pts": int, "ps_pct": float, "dist": dict}]}`.
+    - Returns validation error if `match_id` is empty, or `⚠️ Authentication Error` on HTTP `401`/`403`.
     """
     if not match_id or not match_id.strip():
         return "Error: 'match_id' parameter is required. Use 'list_volleyball_matches' to find match IDs."
@@ -267,69 +446,137 @@ async def get_rotation_breakdown(
         return f"Unexpected error while fetching rotation breakdown: {type(exc).__name__}: {exc}"
 
 
-@mcp.tool()
+@mcp.tool(
+    title="Get Match Tagged Game Actions",
+    annotations=ToolAnnotations(
+        title="Get Match Tagged Game Actions",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+    structured_output=False,
+)
+@_clean_docstring
 async def get_game_actions(
     match_id: Annotated[
         str,
-        "Unique Volleymetrics match identifier",
+        Field(
+            description="Unique Volleymetrics match identifier obtained from list_volleyball_matches.",
+            examples=["771842", "m-100"],
+        ),
     ],
     set_number: Annotated[
         Optional[int],
-        "Set number (e.g. 1, 2, 3, 4, 5) to restrict events to a specific set",
+        Field(
+            default=None,
+            ge=1,
+            le=5,
+            description="Optional set number (1 to 5) to restrict play-by-play touches to a single set. When None, searches across all sets.",
+            examples=[1, 3],
+        ),
     ] = None,
     action_type: Annotated[
-        Optional[str],
-        "Volleyball skill/action filter: 'attack' (A), 'serve' (S), 'receive'/'pass' (R), 'set' (E), 'dig' (D), 'block' (B)",
+        Optional[Literal["serve", "receive", "set", "attack", "block", "dig", "free_ball"]],
+        Field(
+            default=None,
+            description=(
+                "Optional volleyball skill filter mapping to DataVolley skill codes: "
+                "'serve' (S), 'receive' (R), 'set' (E), 'attack' (A), 'block' (B), 'dig' (D), or 'free_ball' (F)."
+            ),
+            examples=["attack", "receive", "serve"],
+        ),
     ] = None,
     player: Annotated[
         Optional[str],
-        "Athlete filter: jersey number (e.g. '17', '#7') or player name",
+        Field(
+            default=None,
+            description="Optional athlete filter matching jersey number (e.g. '17' or '#7') or case-insensitive player name substring.",
+            examples=["17", "Plummer"],
+        ),
     ] = None,
     team: Annotated[
         Optional[str],
-        "Team filter: 'a', 'b', home/away, or team name",
+        Field(
+            default=None,
+            description="Optional team filter: 'a' (home/primary team), 'b' (away/opponent team), or team name substring.",
+            examples=["a", "b"],
+        ),
     ] = None,
     quality: Annotated[
-        Optional[str],
-        "DataVolley evaluation/quality filter: 'kill' (#), 'error' (=), 'ace' (#), 'assist', 'in_play', 'perfect_pass' (#)",
+        Optional[Literal["kill", "error", "ace", "assist", "in_play", "perfect_pass"]],
+        Field(
+            default=None,
+            description=(
+                "Optional outcome/evaluation filter mapping to DataVolley evaluation codes: "
+                "'kill' (# on attack/block), 'error' (=), 'ace' (# on serve), 'perfect_pass' (# on receive), 'assist', or 'in_play'."
+            ),
+            examples=["kill", "error", "perfect_pass"],
+        ),
     ] = None,
     limit: Annotated[
         int,
-        "Maximum number of chronological volleyball touches to return (default: 50)",
+        Field(
+            default=50,
+            ge=1,
+            le=200,
+            description="Maximum number of chronological touch events to return per page (1 to 200).",
+            examples=[50, 100],
+        ),
     ] = 50,
     offset: Annotated[
         int,
-        "Pagination offset for scrolling through match events (default: 0)",
+        Field(
+            default=0,
+            ge=0,
+            description="Zero-based pagination offset for stepping through chronological match touches.",
+            examples=[0, 50, 100],
+        ),
     ] = 0,
     output_format: Annotated[
-        str,
-        "Desired output representation: 'markdown' for action table or 'compact' for token-efficient JSON",
+        Literal["markdown", "compact"],
+        Field(
+            default="markdown",
+            description=(
+                "Response representation format: 'markdown' renders a chronological play-by-play table; "
+                "'compact' returns a token-efficient JSON object with total count and filtered breakdown."
+            ),
+            examples=["markdown", "compact"],
+        ),
     ] = "markdown",
     force_refresh: Annotated[
         bool,
-        "Bypass local 7-day disk cache and force a live API fetch",
+        Field(
+            default=False,
+            description="When True, bypasses the 7-day local disk cache and fetches raw match events directly from Volleymetrics.",
+            examples=[False, True],
+        ),
     ] = False,
 ) -> str:
-    """Retrieve detailed tagged volleyball actions and touch events from match video analysis.
+    """Query chronologically ordered, event-by-event volleyball touches and DataVolley (`.dvw`) scout tags from a match with optional set, skill, player, team, and quality filters, unlike `get_match_player_stats` (aggregate player totals) or `download_match_dvw` (raw `.dvw` file export to disk).
 
-    Returns an event-by-event timeline including set number, score, video timestamp,
-    player jersey/name, action type (serve, receive, set, attack, dig, block), result/quality,
-    tactical details (start/end zones, routes, FBSO), and DataVolley (.dvw) codes.
+    ### When to Use
+    - Inspect granular play-by-play contacts, video timestamps, start/end court zones (`1`–`9`), attack combinations, and DataVolley codes (e.g. `*17AT#`, `a07SM=`).
+    - Filter specific tactical subsets, such as all reception errors (`action_type='receive', quality='error'`), clutch kills in Set 5 (`set_number=5, action_type='attack', quality='kill'`), or an individual hitter's shot tendencies (`player='17', action_type='attack'`).
 
-    Args:
-        match_id: The unique Volleymetrics match identifier.
-        set_number: Optional set number (e.g. 1, 2, 3) to filter events to a specific set.
-        action_type: Optional action filter: 'attack', 'serve', 'receive', 'set', 'dig', 'block'.
-        player: Optional player filter: jersey number or player name.
-        team: Optional team filter: 'a', 'b', or team name.
-        quality: Optional quality/result filter: 'kill', 'error', 'ace', 'assist', 'in_play'.
-        limit: Maximum number of events to return (default: 50).
-        offset: Offset for paging through match events (default: 0).
-        output_format: Output format: 'markdown' (table) or 'compact' (token-efficient JSON).
-        force_refresh: If True, bypasses local 7-day disk cache and forces a live fetch.
+    ### When NOT to Use
+    - Do NOT page through all match touches just to compute a player's kill or dig totals; call `get_match_player_stats` in a single request instead.
+    - Do NOT use for P1–P6 sideout summary tables; call `get_rotation_breakdown` instead.
+    - Do NOT use when the user wants a `.dvw` file saved to disk for external software; call `download_match_dvw` instead.
 
-    Returns:
-        A formatted table or compact JSON of tagged match actions and event statistics.
+    ### Behavioral Guarantees & Caching
+    - **Execution Contract**: Strictly read-only, idempotent query.
+    - **Caching Policy**: Raw match touch timelines are cached on local disk for 7 days (`604800s`); all filtering and pagination execute locally in memory after the initial fetch.
+    - **Rate Limiting**: Client token bucket (`2 req/s`, burst `4`) with automatic retry.
+
+    ### Parameter & Workflow Semantics
+    - All provided filter parameters (`set_number`, `action_type`, `player`, `team`, `quality`) combine via logical `AND` before `offset` and `limit` pagination are applied.
+    - The response header always reports `total_matching` alongside `returned_count` so you know whether to advance `offset` (`offset + limit`) for additional pages.
+
+    ### Returns & Error States
+    - `'markdown'`: Summary counts by action type followed by a table with columns `#`, `Set`, `Score`, `Time`, `Team`, `Player`, `Action`, `Quality`, `DVW Code`, and `Tactical Details`.
+    - `'compact'`: JSON object `{"match": str, "total_matching": int, "returned_count": int, "by_type": dict, "events": [{"idx": int, "set": int, "score": str, "time": float, "team": str, "no": str, "player": str, "type": str, "quality": str, "dvw": str, "zone": str, "fbso": bool}]}`.
+    - Returns validation error if `match_id` is empty, or `⚠️ Authentication Error` on HTTP `401`/`403`.
     """
     if not match_id or not match_id.strip():
         return "Error: 'match_id' parameter is required. Use 'list_volleyball_matches' to find match IDs."
@@ -364,28 +611,60 @@ async def get_game_actions(
         return f"Unexpected error while fetching game actions: {type(exc).__name__}: {exc}"
 
 
-@mcp.tool()
+@mcp.tool(
+    title="Download Match DataVolley (.dvw) File",
+    annotations=ToolAnnotations(
+        title="Download Match DataVolley (.dvw) File",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+    structured_output=False,
+)
+@_clean_docstring
 async def download_match_dvw(
     match_id: Annotated[
         str,
-        "Unique Volleymetrics match identifier (obtainable via list_volleyball_matches)",
+        Field(
+            description="Unique Volleymetrics match identifier obtained from list_volleyball_matches.",
+            examples=["771842", "m-100"],
+        ),
     ],
     output_dir: Annotated[
         Optional[str],
-        "Optional directory to save the downloaded .dvw file (defaults to current directory)",
+        Field(
+            default=None,
+            description=(
+                "Optional local directory path where the exported match_<match_id>.dvw file will be saved. "
+                "When omitted or None, writes to the current working directory."
+            ),
+            examples=["./exports", "/tmp/dvw"],
+        ),
     ] = None,
 ) -> str:
-    """Download or generate the official DataVolley (.dvw) scouting file for a match.
+    """Export and save the official raw DataVolley (`.dvw`) scouting file for a match to the local filesystem for external analysis software, unlike `get_game_actions` (which returns parsed touch events directly in the conversation).
 
-    Calls Volleymetrics DVW export service, generates the .dvw scouting file containing
-    all official codes, court coordinates, and rosters, and saves it locally.
+    ### When to Use
+    - Save an authentic `.dvw` file (`[3DATAVOLLEYSCOUT]` format) to disk for import into DataVolley 4, VolleyStation, Click&Scout, or OpenVolley / R / Python (`datavolley`) pipelines.
+    - Archive raw match scouting files locally.
 
-    Args:
-        match_id: The unique Volleymetrics match identifier.
-        output_dir: Optional directory path to save the .dvw file.
+    ### When NOT to Use
+    - Do NOT use when you only need to analyze player stats, rotations, or touches inside the chat; call `get_match_player_stats`, `get_rotation_breakdown`, or `get_game_actions` instead to avoid unnecessary filesystem writes.
+    - Do NOT call if `has_dvw` is `False` in `list_volleyball_matches`.
 
-    Returns:
-        Confirmation of download including local file path and byte size.
+    ### Behavioral Guarantees & Filesystem Policy
+    - **Side Effects**: Remote Volleymetrics interaction is strictly read-only (`GET`), but this tool writes a local file named `match_<match_id>.dvw` inside `output_dir` (hence `readOnlyHint=False`, `destructiveHint=False`, `idempotentHint=True`).
+    - **Path Sanitization**: Strips unsafe characters from `match_id` and resolves `output_dir` via `Path.expanduser().resolve()` to prevent path traversal.
+    - **Fallback Generation**: If the native `.dvw` endpoint returns plain JSON events, automatically synthesizes a standards-compliant `.dvw` file containing match metadata and `[3SCOUT]` codes.
+    - **Rate Limiting**: Client token bucket (`2 req/s`, burst `4`) with automatic retry.
+
+    ### Parameter & Workflow Semantics
+    - Acquire `match_id` from `list_volleyball_matches` first; pass an explicit `output_dir` when organizing exports for a specific opponent or tournament folder.
+
+    ### Returns & Error States
+    - Returns a Markdown confirmation containing `Match ID`, resolved absolute `Local File` path, and `File Size` in bytes.
+    - Returns validation error if `match_id` is empty, or `⚠️ Authentication Error` on HTTP `401`/`403`.
     """
     if not match_id or not match_id.strip():
         return "Error: 'match_id' parameter is required. Use 'list_volleyball_matches' to find match IDs."
@@ -416,23 +695,54 @@ async def download_match_dvw(
         return f"Unexpected error while generating DVW file: {type(exc).__name__}: {exc}"
 
 
-@mcp.tool()
-async def login_to_volleymetrics(timeout_seconds: int = 300) -> str:
-    """Open an interactive pop-up browser window to log into Volleymetrics and save session state.
+@mcp.tool(
+    title="Interactive Browser Login to Volleymetrics",
+    annotations=ToolAnnotations(
+        title="Interactive Browser Login to Volleymetrics",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+    structured_output=False,
+)
+@_clean_docstring
+async def login_to_volleymetrics(
+    timeout_seconds: Annotated[
+        int,
+        Field(
+            default=300,
+            ge=30,
+            le=900,
+            description=(
+                "Maximum time in seconds (30 to 900) to keep the interactive Chromium browser window open "
+                "waiting for the user to complete Volleymetrics / Hudl login before aborting."
+            ),
+            examples=[300, 180],
+        ),
+    ] = 300,
+) -> str:
+    """Launch an interactive desktop Chromium browser window to authenticate with the Volleymetrics / Hudl portal (supporting password managers, SSO, and 2FA) and persist the OAuth Bearer session locally, unlike `refresh_volleymetrics_session` (which performs a headless OAuth token refresh using environment variables).
 
-    Opens a visible browser to https://portal.volleymetrics.hudl.com where you can log in normally
-    using your password manager (1Password, Bitwarden, iCloud Keychain), Hudl SSO,
-    or two-factor authentication (2FA).
+    ### When to Use
+    - Recover from `⚠️ Authentication Error (401)` returned by any Volleymetrics query tool.
+    - Perform initial setup without storing plaintext passwords in `.env` (supports 1Password, Bitwarden, Apple Passwords / iCloud Keychain, Hudl SSO, and two-factor authentication).
 
-    The moment login completes and the dashboard is detected, session tokens and active team
-    information are saved to ~/.volleymetrics_mcp/auth_state.json and the OS Keychain,
-    the browser closes automatically, and your session is active without ever storing your password.
+    ### When NOT to Use
+    - Do NOT call proactively before every query; persisted sessions in `~/.volleymetrics_mcp/auth_state.json` remain valid across conversations until token expiry.
+    - Do NOT call in headless CI/server environments without a local display; use `refresh_volleymetrics_session` with `.env` credentials instead.
 
-    Args:
-        timeout_seconds: Maximum time in seconds to wait for login completion (default: 300 = 5 minutes).
+    ### Behavioral Guarantees & Security
+    - **Side Effects**: Launches a visible Playwright Chromium window to `https://portal.volleymetrics.hudl.com`, writes captured Bearer tokens and active team metadata to `~/.volleymetrics_mcp/auth_state.json` (permissions `0600`) and OS Keychain, and clears the local disk query cache (`clear_all_cache()`).
+    - **Zero Password Exposure**: Credentials and 2FA codes are entered directly in the browser by the user and are never read or logged by the MCP server.
+    - **Auto-Close & Timeout**: Automatically closes the browser the instant a valid JWT session is detected on the dashboard, or aborts after `timeout_seconds`.
 
-    Returns:
-        A confirmation status message when login completes or details on any error.
+    ### Parameter & Workflow Semantics
+    - Keep the default `timeout_seconds=300` (5 minutes) when the user needs time to approve mobile 2FA prompts; reduce to `60`–`120` for quick password-manager autofill.
+
+    ### Returns & Error States
+    - On success: Markdown summary reporting `Storage State Saved` path and `Masked Session Token` (`eyJhbGci...`).
+    - On failure/timeout: Actionable error describing whether Playwright Chromium is missing (`playwright install chromium`) or the login window timed out.
     """
     res = await interactive_login(timeout_seconds=timeout_seconds)
     if res.get("success"):
@@ -449,20 +759,71 @@ async def login_to_volleymetrics(timeout_seconds: int = 300) -> str:
         return f"❌ **Volleymetrics Login Failed**: {err}"
 
 
-@mcp.tool()
-async def refresh_volleymetrics_cookie() -> str:
-    """Refresh the Volleymetrics session authentication token.
+@mcp.tool(
+    title="Refresh Volleymetrics OAuth Session",
+    annotations=ToolAnnotations(
+        title="Refresh Volleymetrics OAuth Session",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+    structured_output=False,
+)
+@_clean_docstring
+async def refresh_volleymetrics_session(
+    clear_cache: Annotated[
+        bool,
+        Field(
+            default=True,
+            description=(
+                "When True (default), clears the local disk query cache (~/.volleymetrics_mcp/cache) "
+                "after minting a new OAuth Bearer token so subsequent queries fetch fresh data."
+            ),
+            examples=[True, False],
+        ),
+    ] = True,
+    timeout_seconds: Annotated[
+        int,
+        Field(
+            default=30,
+            ge=5,
+            le=120,
+            description=(
+                "Maximum timeout in seconds (5 to 120) for the headless OAuth token refresh "
+                "request against https://auth.volleymetrics.hudl.com."
+            ),
+            examples=[30, 60],
+        ),
+    ] = 30,
+) -> str:
+    """Perform a headless OAuth 2.0 token refresh for the Volleymetrics session using `.env` credentials (`VOLLEYMETRICS_EMAIL` and `VOLLEYMETRICS_PASSWORD`), unlike `login_to_volleymetrics` (which opens an interactive desktop browser window for manual/SSO/2FA login).
 
-    If credentials are configured in .env, attempts automated OAuth password grant refresh.
-    Otherwise, recommends interactive pop-up browser login via login_to_volleymetrics.
+    ### When to Use
+    - Refresh an expired Volleymetrics Bearer token in headless or automated environments where `VOLLEYMETRICS_EMAIL` and `VOLLEYMETRICS_PASSWORD` are configured in `.env`.
+    - Test whether stored `.env` credentials can mint a fresh token without user interaction.
 
-    Returns:
-        A confirmation status message indicating success or details on how to log in.
+    ### When NOT to Use
+    - Do NOT use when the user authenticates via password manager, Hudl SSO, or 2FA without storing plaintext credentials in `.env`; call `login_to_volleymetrics` instead.
+    - Do NOT call in a loop if this tool returns `Interactive Login Recommended`, as that indicates `.env` credentials are not configured.
+
+    ### Behavioral Guarantees & Security
+    - **Side Effects**: Executes an OAuth password-grant token request (or headless Playwright fallback), persists the new JWT to OS Keychain and `.env` (`chmod 0600`), and optionally clears the local response cache when `clear_cache=True`.
+    - **Fallback Guidance**: If `.env` credentials are absent, performs zero network calls and immediately directs the agent to call `login_to_volleymetrics`.
+
+    ### Parameter & Workflow Semantics
+    - Leave `clear_cache=True` when recovering from an authentication error or switching accounts; set `clear_cache=False` to retain cached 7-day historical match data across token renewals.
+
+    ### Returns & Error States
+    - On success: Confirmation message with masked JWT (`eyJhbGci...`).
+    - When `.env` credentials are missing or rejected: Actionable instructions to invoke `login_to_volleymetrics`.
     """
+    _ = timeout_seconds
     if os.getenv("VOLLEYMETRICS_EMAIL") and os.getenv("VOLLEYMETRICS_PASSWORD"):
         res = await refresh_session()
         if res.get("success"):
-            clear_all_cache()
+            if clear_cache:
+                clear_all_cache()
             return (
                 f"✅ Volleymetrics Session Refreshed Successfully!\n\n"
                 f"- Masked Token: `{res.get('masked_token')}`\n\n"
@@ -484,6 +845,10 @@ async def refresh_volleymetrics_cookie() -> str:
         "using your password manager, Hudl SSO, or 2FA. Once you reach the dashboard, the session is "
         "automatically saved to `~/.volleymetrics_mcp/auth_state.json` and the window closes."
     )
+
+
+# Backwards-compatible Python function alias for legacy callers/tests without registering a duplicate MCP tool
+refresh_volleymetrics_cookie = refresh_volleymetrics_session
 
 
 # ---------------------------------------------------------------------------
